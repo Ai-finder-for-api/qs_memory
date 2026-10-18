@@ -1,0 +1,24 @@
+[package]
+name = "qs_memory"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.77"
+description = "Quantum Suite memory management: zero dependencies, builds as qs_memory.dll"
+publish = false
+
+[dependencies]
+
+[lib]
+name = "qs_memory"
+path = "src/lib.rs"
+crate-type = ["cdylib", "rlib"]
+
+[[bench]]
+name = "allocators"
+path = "benches/allocators.rs"
+harness = false
+
+[[bench]]
+name = "containers"
+path = "benches/containers.rs"
+harness = false

@@ -1,0 +1,24 @@
+//! Allocators: one module per storage strategy, plus the shared Allocator contract.
+pub mod traits;
+pub mod system;
+pub mod arena;
+pub mod stack;
+pub mod pool;
+pub mod freelist;
+pub mod buddy;
+pub mod size_class;
+pub mod slab;
+pub mod chunked;
+pub mod page;
+pub mod double_ended;
+pub mod resize;
+pub mod typed;
+pub mod bulk;
+pub mod tlsf;
+pub mod ring;
+pub mod introspect;
+pub mod thread_cache;
+pub mod sharded;
+pub mod shared;
+pub mod huge;
+pub mod small_cache;

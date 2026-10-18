@@ -1,0 +1,369 @@
+//! Two-level segregated fit (TLSF) allocator.
+//!
+//! The region is a sequence of blocks. Each block starts with a 16-byte header:
+//!
+//! - word 0: the block size, with a 4-bit tag in the low bits (`ALLOC_TAG` or `FREE_TAG`);
+//! - word 1: the offset of the physically previous block, or `NONE` for the first block.
+//!
+//! Free blocks also keep their free-list links in their payload. Free lists are indexed by a first
+//! level (the power of two of the size) and a second level (one of 16 slices of that power). Finding a
+//! fitting block is two bit scans, so allocation and release take bounded time.
+//!
+//! Limits:
+//! - Alignment up to 16 bytes. Larger alignments return `NotSupported`.
+//! - Misuse detection is best effort. Foreign ranges, misaligned pointers and double frees of an
+//!   isolated block are refused. A double free of a block that has since been merged into a free
+//!   neighbour may be reported as `InvalidFree`, or in rare cases not detected at all, because the
+//!   old header then lies inside another free block's payload.
+
+use crate::allocators::system::SystemAllocator;
+use crate::allocators::traits::Allocator;
+use crate::foundation::block::Block;
+use crate::foundation::capability::Capabilities;
+use crate::foundation::error::{AllocError, AllocResult};
+use core::cell::Cell;
+
+const HDR: usize = 16;
+const UNIT: usize = 16;
+const MIN_BLOCK: usize = 32;
+const NONE: usize = usize::MAX;
+const TAG_MASK: usize = 0xF;
+const ALLOC_TAG: usize = 0xA;
+const FREE_TAG: usize = 0x5;
+const SMALL: usize = 256;
+const SL: usize = 16;
+const FL: usize = 64;
+
+fn floor_log2(n: usize) -> usize {
+    (usize::BITS - 1 - n.leading_zeros()) as usize
+}
+
+/// Free-list indices for a block of `size` bytes (exact placement).
+fn mapping_insert(size: usize) -> (usize, usize) {
+    if size < SMALL {
+        (0, size >> 4)
+    } else {
+        let fl = floor_log2(size);
+        (fl - 7, (size >> (fl - 4)) & (SL - 1))
+    }
+}
+
+/// Free-list indices from which any block can satisfy a request of `size` bytes.
+fn mapping_search(size: usize) -> (usize, usize) {
+    if size >= SMALL {
+        let round = (1usize << (floor_log2(size) - 4)) - 1;
+        mapping_insert(size + round)
+    } else {
+        mapping_insert(size)
+    }
+}
+
+/// A TLSF heap over a region it owns.
+pub struct Tlsf {
+    backing: SystemAllocator,
+    region: Block,
+    base: *mut u8,
+    len: usize,
+    fl_map: Cell<u64>,
+    sl_map: Vec<Cell<u16>>,
+    heads: Vec<Cell<usize>>,
+}
+
+impl Tlsf {
+    /// Creates a heap over `capacity` bytes (rounded down to 16). The region is one free block.
+    pub fn new(capacity: usize) -> AllocResult<Self> {
+        let len = capacity & !(UNIT - 1);
+        if len < MIN_BLOCK {
+            return Err(AllocError::InvalidArgument);
+        }
+        let backing = SystemAllocator::new();
+        let region = backing.allocate(len, UNIT)?;
+        let heap = Tlsf {
+            backing,
+            region,
+            base: region.ptr(),
+            len,
+            fl_map: Cell::new(0),
+            sl_map: (0..FL).map(|_| Cell::new(0)).collect(),
+            heads: (0..FL * SL).map(|_| Cell::new(NONE)).collect(),
+        };
+        // SAFETY: offset 0 is the start of the region, which holds at least MIN_BLOCK bytes.
+        unsafe { heap.write_header(0, len, FREE_TAG, NONE) };
+        // SAFETY: block 0 was just written as a free block of `len` bytes.
+        unsafe { heap.insert_free(0, len) };
+        Ok(heap)
+    }
+
+    /// Size of the region in bytes.
+    pub fn capacity(&self) -> usize {
+        self.len
+    }
+
+    /// Number of free blocks, found by walking the region.
+    pub fn free_block_count(&self) -> usize {
+        let mut count = 0;
+        let mut off = 0;
+        while off < self.len {
+            // SAFETY: `off` walks block starts inside the region.
+            let (size, tag, _) = unsafe { self.read(off) };
+            if tag == FREE_TAG {
+                count += 1;
+            }
+            off += size;
+        }
+        count
+    }
+
+    unsafe fn word(&self, off: usize, index: usize) -> *mut usize {
+        // SAFETY (caller): `off` is the start of a block inside the region and `index` is within a block.
+        unsafe { (self.base.add(off) as *mut usize).add(index) }
+    }
+
+    unsafe fn read(&self, off: usize) -> (usize, usize, usize) {
+        // SAFETY: `off` is a 16-byte aligned block start inside the region, so the header is readable.
+        unsafe {
+            let w0 = *self.word(off, 0);
+            let prev = *self.word(off, 1);
+            (w0 & !TAG_MASK, w0 & TAG_MASK, prev)
+        }
+    }
+
+    unsafe fn write_header(&self, off: usize, size: usize, tag: usize, prev: usize) {
+        // SAFETY: `off` is a block start inside the region.
+        unsafe {
+            *self.word(off, 0) = size | tag;
+            *self.word(off, 1) = prev;
+        }
+    }
+
+    unsafe fn insert_free(&self, off: usize, size: usize) {
+        let (fl, sl) = mapping_insert(size);
+        let idx = fl * SL + sl;
+        let head = self.heads[idx].get();
+        // SAFETY: a free block has at least MIN_BLOCK bytes, so words 2 and 3 are inside it.
+        unsafe {
+            *self.word(off, 2) = head;
+            *self.word(off, 3) = NONE;
+            if head != NONE {
+                *self.word(head, 3) = off;
+            }
+        }
+        self.heads[idx].set(off);
+        self.sl_map[fl].set(self.sl_map[fl].get() | (1u16 << sl));
+        self.fl_map.set(self.fl_map.get() | (1u64 << fl));
+    }
+
+    unsafe fn remove_free(&self, off: usize, size: usize) {
+        let (fl, sl) = mapping_insert(size);
+        let idx = fl * SL + sl;
+        // SAFETY: `off` is a free block of `size` bytes currently on its list, so its links are valid.
+        let (next, prev) = unsafe { (*self.word(off, 2), *self.word(off, 3)) };
+        if prev != NONE {
+            // SAFETY: `prev` is a free block on the same list.
+            unsafe { *self.word(prev, 2) = next };
+        } else {
+            self.heads[idx].set(next);
+        }
+        if next != NONE {
+            // SAFETY: `next` is a free block on the same list.
+            unsafe { *self.word(next, 3) = prev };
+        }
+        if self.heads[idx].get() == NONE {
+            let bits = self.sl_map[fl].get() & !(1u16 << sl);
+            self.sl_map[fl].set(bits);
+            if bits == 0 {
+                self.fl_map.set(self.fl_map.get() & !(1u64 << fl));
+            }
+        }
+    }
+
+    fn find_suitable(&self, fl: usize, sl: usize) -> Option<(usize, usize)> {
+        let same_level = self.sl_map[fl].get() & (!0u16 << sl);
+        if same_level != 0 {
+            return Some((fl, same_level.trailing_zeros() as usize));
+        }
+        let higher = self.fl_map.get() & (!0u64).checked_shl(fl as u32 + 1).unwrap_or(0);
+        if higher == 0 {
+            return None;
+        }
+        let f = higher.trailing_zeros() as usize;
+        Some((f, self.sl_map[f].get().trailing_zeros() as usize))
+    }
+
+    /// Checks every structural invariant: blocks tile the region, tags are valid, physical links
+    /// agree, no two free blocks are adjacent, and the free lists and bitmaps match the free blocks.
+    pub fn verify(&self) -> AllocResult<()> {
+        let mut off = 0;
+        let mut prev = NONE;
+        let mut prev_free = false;
+        let mut free_blocks = 0usize;
+        while off < self.len {
+            // SAFETY: `off` walks block starts inside the region.
+            let (size, tag, p) = unsafe { self.read(off) };
+            let valid_tag = tag == ALLOC_TAG || tag == FREE_TAG;
+            if !valid_tag || size < MIN_BLOCK || size % UNIT != 0 || off + size > self.len || p != prev {
+                return Err(AllocError::Corruption);
+            }
+            let free = tag == FREE_TAG;
+            if free {
+                if prev_free {
+                    return Err(AllocError::Corruption);
+                }
+                free_blocks += 1;
+            }
+            prev_free = free;
+            prev = off;
+            off += size;
+        }
+        if off != self.len {
+            return Err(AllocError::Corruption);
+        }
+        let mut listed = 0usize;
+        for fl in 0..FL {
+            let bits = self.sl_map[fl].get();
+            if (bits != 0) != (self.fl_map.get() & (1u64 << fl) != 0) {
+                return Err(AllocError::Corruption);
+            }
+            for sl in 0..SL {
+                let idx = fl * SL + sl;
+                let mut node = self.heads[idx].get();
+                if (node != NONE) != (bits & (1u16 << sl) != 0) {
+                    return Err(AllocError::Corruption);
+                }
+                while node != NONE {
+                    // SAFETY: `node` is a block start on a free list, which the walk above validated.
+                    let (size, tag, _) = unsafe { self.read(node) };
+                    if tag != FREE_TAG || mapping_insert(size) != (fl, sl) {
+                        return Err(AllocError::Corruption);
+                    }
+                    listed += 1;
+                    if listed > free_blocks {
+                        return Err(AllocError::Corruption);
+                    }
+                    // SAFETY: as above.
+                    node = unsafe { *self.word(node, 2) };
+                }
+            }
+        }
+        if listed != free_blocks {
+            return Err(AllocError::Corruption);
+        }
+        Ok(())
+    }
+}
+
+impl Allocator for Tlsf {
+    fn allocate(&self, size: usize, align: usize) -> AllocResult<Block> {
+        if !align.is_power_of_two() {
+            return Err(AllocError::InvalidAlignment);
+        }
+        if size == 0 {
+            return Ok(Block::empty(align));
+        }
+        if align > UNIT {
+            return Err(AllocError::NotSupported);
+        }
+        let payload = size.checked_add(UNIT - 1).ok_or(AllocError::Overflow)? & !(UNIT - 1);
+        let need = payload.checked_add(HDR).ok_or(AllocError::Overflow)?.max(MIN_BLOCK);
+        if need > self.len {
+            return Err(AllocError::CapacityExhausted);
+        }
+        let (fl, sl) = mapping_search(need);
+        let (f, s) = self.find_suitable(fl, sl).ok_or(AllocError::CapacityExhausted)?;
+        let off = self.heads[f * SL + s].get();
+        // SAFETY: `off` is the head of a non-empty free list, so it is a valid free block start.
+        let (bsize, _, prev) = unsafe { self.read(off) };
+        // SAFETY: `off` is on the list for its size.
+        unsafe { self.remove_free(off, bsize) };
+        let final_size = if bsize - need >= MIN_BLOCK {
+            let rest = off + need;
+            let rest_size = bsize - need;
+            // SAFETY: `rest` lies inside the block being split, which has `bsize` bytes.
+            unsafe { self.write_header(rest, rest_size, FREE_TAG, off) };
+            let after = off + bsize;
+            if after < self.len {
+                // SAFETY: `after` is the next block start; its previous block is now `rest`.
+                unsafe { *self.word(after, 1) = rest };
+            }
+            // SAFETY: `rest` is a free block of `rest_size` bytes.
+            unsafe { self.insert_free(rest, rest_size) };
+            need
+        } else {
+            bsize
+        };
+        // SAFETY: the block at `off` is now allocated with `final_size` bytes.
+        unsafe { self.write_header(off, final_size, ALLOC_TAG, prev) };
+        // SAFETY: `off + HDR` is inside the region, since the block holds at least HDR bytes of header.
+        let ptr = unsafe { self.base.add(off + HDR) };
+        // SAFETY: the payload is `final_size - HDR` bytes inside the region.
+        Ok(unsafe { Block::from_raw_parts(ptr, final_size - HDR, align) })
+    }
+
+    unsafe fn deallocate(&self, block: Block) -> AllocResult<()> {
+        if block.is_empty() {
+            return Ok(());
+        }
+        let addr = block.ptr() as usize;
+        let start = self.base as usize;
+        if addr < start + HDR || addr >= start + self.len {
+            return Err(AllocError::NotOwned);
+        }
+        let off = addr - start - HDR;
+        if off % UNIT != 0 {
+            return Err(AllocError::InvalidFree);
+        }
+        // SAFETY: `off` lies inside the region and is 16-byte aligned, so its header is readable.
+        let (size, tag, prev) = unsafe { self.read(off) };
+        if tag == FREE_TAG {
+            return Err(AllocError::DoubleFree);
+        }
+        if tag != ALLOC_TAG || size < MIN_BLOCK || off + size > self.len {
+            return Err(AllocError::InvalidFree);
+        }
+        let mut start_off = off;
+        let mut total = size;
+        let mut new_prev = prev;
+        if prev != NONE {
+            // SAFETY: `prev` is the physical previous block, which is a valid block start.
+            let (psize, ptag, pprev) = unsafe { self.read(prev) };
+            if ptag == FREE_TAG {
+                // SAFETY: the previous block is free and on the list for its size.
+                unsafe { self.remove_free(prev, psize) };
+                start_off = prev;
+                total += psize;
+                new_prev = pprev;
+            }
+        }
+        let after = off + size;
+        if after < self.len {
+            // SAFETY: `after` is the next block start.
+            let (nsize, ntag, _) = unsafe { self.read(after) };
+            if ntag == FREE_TAG {
+                // SAFETY: the next block is free and on the list for its size.
+                unsafe { self.remove_free(after, nsize) };
+                total += nsize;
+            }
+        }
+        // SAFETY: `start_off` begins a block of `total` bytes that is now free.
+        unsafe { self.write_header(start_off, total, FREE_TAG, new_prev) };
+        let end = start_off + total;
+        if end < self.len {
+            // SAFETY: `end` is the next block start; its previous block is now `start_off`.
+            unsafe { *self.word(end, 1) = start_off };
+        }
+        // SAFETY: the merged block is free and has `total` bytes.
+        unsafe { self.insert_free(start_off, total) };
+        Ok(())
+    }
+
+    fn capabilities(&self) -> Capabilities {
+        Capabilities::ALLOCATE.union(Capabilities::INDIVIDUAL_FREE)
+    }
+}
+
+impl Drop for Tlsf {
+    fn drop(&mut self) {
+        // SAFETY: `region` came from `backing` and is released exactly once, here.
+        let _ = unsafe { self.backing.deallocate(self.region) };
+    }
+}

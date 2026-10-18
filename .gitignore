@@ -1,0 +1,32 @@
+# Quantum Suite — qs_memory
+
+# Rust build artifacts
+/target/
+
+# Compiled native binaries and objects
+*.dll
+*.exe
+*.so
+*.dylib
+*.lib
+*.a
+*.obj
+*.o
+*.pdb
+*.ilk
+*.exp
+*.rmeta
+*.rlib
+
+# Logs and crash dumps
+*.log
+*.dmp
+*.stackdump
+
+# Editor and OS noise
+.vs/
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
